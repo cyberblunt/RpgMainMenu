@@ -40,15 +40,18 @@ fun LoadoutSlotChips(
             val borderColor = if (selected) YellowAccent else CyanGlow.copy(alpha = 0.3f)
             Row(
                 modifier = Modifier
-                    .size(width = 44.dp, height = 40.dp)
+                    .size(width = 48.dp, height = 40.dp)
                     .clip(RoundedCornerShape(8.dp))
                     .background(if (selected) PanelBlueBright else PanelBlueBright.copy(alpha = 0.7f))
                     .border(2.dp, borderColor, RoundedCornerShape(8.dp))
                     .clickable { onSelectSlot(summary.slotIndex) }
-                    .padding(4.dp),
+                    .padding(horizontal = 2.dp, vertical = 4.dp),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.Center,
             ) {
+                if (selected) {
+                    Text("★", style = MaterialTheme.typography.labelSmall, color = YellowAccent)
+                }
                 Text(
                     text = label,
                     style = MaterialTheme.typography.titleMedium,

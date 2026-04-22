@@ -8,6 +8,7 @@ import com.zerotoler.rpgmenu.domain.engine.BattleStatNormalization
 import com.zerotoler.rpgmenu.domain.engine.BattleEngine
 import com.zerotoler.rpgmenu.domain.model.battle.BattleOutcome
 import com.zerotoler.rpgmenu.domain.model.battle.BattleRenderSnapshot
+import com.zerotoler.rpgmenu.domain.model.battle.VisualParticle
 import com.zerotoler.rpgmenu.domain.model.battlesession.BattleRoundResult
 import com.zerotoler.rpgmenu.domain.usecase.BuildBattleTopFromSelectedLoadoutUseCase
 import java.util.concurrent.atomic.AtomicBoolean
@@ -30,6 +31,8 @@ class RealBattleViewModel(
     private val resolving = AtomicBoolean(false)
     private val outcomeRecorded = AtomicBoolean(false)
 
+    private val visualParticles = mutableListOf<VisualParticle>()
+
     private val _ui = MutableStateFlow(
         RealBattleUiState(
             render = BattleRenderSnapshot.empty(),
@@ -38,6 +41,8 @@ class RealBattleViewModel(
             enemyDisplayName = "",
             isBusy = false,
             fatalError = null,
+            autoBattle = false,
+            visualParticles = emptyList(),
         ),
     )
     val uiState: StateFlow<RealBattleUiState> = _ui.asStateFlow()
@@ -77,6 +82,11 @@ class RealBattleViewModel(
                     sessionSeed = snap.sessionId.hashCode(),
                     roundIndex = roundIdx,
                 )
+                eng.onBattleCollision = { wx, wy, _, attackDash ->
+                    synchronized(visualParticles) {
+                        createSparks(visualParticles, wx.toFloat(), wy.toFloat(), attackDash)
+                    }
+                }
                 engine = eng
                 _ui.update {
                     it.copy(
@@ -85,6 +95,7 @@ class RealBattleViewModel(
                         playerDisplayName = playerTop.displayName,
                         enemyDisplayName = round.opponentTop.name,
                         fatalError = null,
+                        visualParticles = emptyList(),
                     )
                 }
             } catch (_: Throwable) {
@@ -98,7 +109,27 @@ class RealBattleViewModel(
     }
 
     fun onSnapshot(snapshot: BattleRenderSnapshot) {
-        _ui.update { it.copy(render = snapshot) }
+        val dt = 1f / 60f
+        val particlesCopy = synchronized(visualParticles) {
+            var i = 0
+            while (i < visualParticles.size) {
+                val p = visualParticles[i]
+                p.x += p.vx * dt
+                p.y += p.vy * dt
+                p.life -= p.decay
+                if (p.life <= 0f) {
+                    visualParticles.removeAt(i)
+                } else {
+                    i++
+                }
+            }
+            visualParticles.toList()
+        }
+        _ui.update { it.copy(render = snapshot, visualParticles = particlesCopy) }
+    }
+
+    fun toggleAutoBattle() {
+        _ui.update { it.copy(autoBattle = !it.autoBattle) }
     }
 
     fun onSuperAbility() {
@@ -142,5 +173,31 @@ class RealBattleViewModel(
 
     override fun onCleared() {
         super.onCleared()
+    }
+
+    private fun createSparks(
+        particles: MutableList<VisualParticle>,
+        px: Float,
+        py: Float,
+        isAttackDash: Boolean,
+    ) {
+        val count = if (isAttackDash) 10 else 25
+        val color = if (isAttackDash) (0xFFFF0000.toInt()) else (0xFFFFFFFF.toInt())
+        repeat(count) {
+            val angle = Math.random() * Math.PI * 2
+            val speed = Math.random() * 5.0
+            particles.add(
+                VisualParticle(
+                    x = px,
+                    y = py,
+                    vx = (Math.cos(angle) * speed).toFloat(),
+                    vy = (Math.sin(angle) * speed).toFloat(),
+                    life = 1.0f,
+                    decay = (Math.random() * 0.04 + 0.01).toFloat(),
+                    size = (Math.random() * 4 + 1).toFloat(),
+                    colorArgb = color,
+                ),
+            )
+        }
     }
 }

@@ -23,10 +23,11 @@ data class BattleTopStats(
      */
     val ringClass: RingClass = RingClass.UNKNOWN,
     val driverClass: DriverClass = DriverClass.UNKNOWN,
-    /** Stabilization target derived from [driverClass] + [ringClass]. */
+    /** Stabilization from [driverClass] + [ringClass] only (see [StabilizationLevel.fromDriverAndRing]). */
     val stabilizationLevel: StabilizationLevel = StabilizationLevel.INNER_RING,
     /** Physical weight in grams (clamped to gameplay-supported range). */
     val weightGrams: Float = 45f,
+    /** Sim-space top radius (typ. ~0.08 when arena radius is ~1.0). */
     val radius: Float,
     val mass: Float,
     val maxHealth: Float,

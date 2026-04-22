@@ -15,6 +15,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import com.zerotoler.rpgmenu.domain.model.PartCategory
 import com.zerotoler.rpgmenu.ui.mainmenu.NotificationBadge
 import com.zerotoler.rpgmenu.ui.theme.CyanGlow
@@ -49,7 +50,7 @@ fun PartCategoryTabs(
                     .background(if (sel) YellowAccent.copy(alpha = 0.35f) else PanelBlueBright)
                     .border(1.dp, CyanGlow.copy(alpha = 0.25f), RoundedCornerShape(10.dp))
                     .clickable { onSelect(cat) }
-                    .padding(vertical = 10.dp, horizontal = 6.dp),
+                    .padding(vertical = 6.dp, horizontal = 4.dp),
                 contentAlignment = Alignment.Center,
             ) {
                 Box {
@@ -57,8 +58,9 @@ fun PartCategoryTabs(
                         text = label,
                         style = MaterialTheme.typography.labelSmall,
                         color = TextPrimary,
+                        fontSize = 10.sp,
                         maxLines = 2,
-                        modifier = Modifier.padding(end = 12.dp),
+                        modifier = Modifier.padding(end = 10.dp),
                     )
                     NotificationBadge(
                         modifier = Modifier.align(Alignment.TopEnd),

@@ -12,6 +12,7 @@ import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.rotate
 import androidx.compose.ui.graphics.drawscope.translate
+import androidx.compose.ui.graphics.drawscope.withTransform
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.ui.input.pointer.pointerInput
@@ -41,7 +42,10 @@ fun BattleArena(
         val w = constraints.maxWidth.toFloat().coerceAtLeast(1f)
         val h = constraints.maxHeight.toFloat().coerceAtLeast(1f)
         val minPx = kotlin.math.min(w, h)
-        val arenaRadiusPx = kotlin.math.max(minPx * 0.48f, minArenaRadiusPx)
+        val arenaRadiusPx = kotlin.math.max(
+            minPx * 0.45f * 1.1f * 3.5f / 3f * 0.95f,
+            minArenaRadiusPx * 1.1f * 3.5f / 3f * 0.95f,
+        )
         val scale = arenaRadiusPx / snapshot.arenaRadius.coerceAtLeast(0.25f)
         val cx = w * 0.5f
         val cy = h * 0.5f
@@ -157,36 +161,72 @@ fun BattleArena(
                     drawCircle(Color.White.copy(alpha = 0.22f), dotR, po)
                 }
 
-                fun drawTop(px: Float, py: Float, angleRad: Float, radius: Float, color: Color, flash: Float) {
-                    val o = Offset(cx + px * scale, cy + py * scale)
-                    val r = (radius * scale).coerceAtLeast(4f)
-                    drawCircle(
-                        color = color.copy(alpha = 0.35f + flash * 0.35f),
-                        // Keep aura tight enough so bigger tops don't clip against the arena wall.
-                        radius = r * 1.08f,
-                        center = o,
+                for (pt in snapshot.particles) {
+                    val po = Offset(cx + pt.x * scale, cy + pt.y * scale)
+                    val a = pt.colorArgb
+                    val alpha = (((a ushr 24) and 0xff) / 255f) * pt.life.coerceIn(0f, 1f)
+                    val c = Color(
+                        red = ((a shr 16) and 0xff) / 255f,
+                        green = ((a shr 8) and 0xff) / 255f,
+                        blue = (a and 0xff) / 255f,
+                        alpha = alpha.coerceIn(0f, 1f),
                     )
-                    rotate(angleRad * (180f / PI.toFloat()), o) {
-                        drawCircle(color = color, radius = r, center = o)
-                        val strokeW = (2.4f + r * 0.14f).coerceIn(2.4f, 8f)
-                        drawLine(
-                            color = Color.White.copy(alpha = 0.85f),
-                            start = o,
-                            end = Offset(o.x + r * 0.78f, o.y),
-                            strokeWidth = strokeW,
+                    drawCircle(color = c, radius = (pt.size * scale).coerceIn(1.5f, 18f), center = po)
+                }
+
+                fun drawTopBeyblade(
+                    px: Float,
+                    py: Float,
+                    angleRad: Float,
+                    radius: Float,
+                    color: Color,
+                    flash: Float,
+                    attacking: Boolean,
+                ) {
+                    val topCenter = Offset(cx + px * scale, cy + py * scale)
+                    val rPx = (radius * scale).coerceAtLeast(4f)
+                    val strokeColor = color.copy(alpha = (0.92f + flash * 0.08f).coerceIn(0.55f, 1f))
+                    withTransform({
+                        translate(topCenter.x, topCenter.y)
+                        rotate(degrees = angleRad * (180f / PI.toFloat()), pivot = Offset.Zero)
+                    }) {
+                        drawCircle(color = Color(0xFF222222), radius = rPx, center = Offset.Zero)
+                        drawCircle(
+                            color = strokeColor,
+                            radius = rPx,
+                            center = Offset.Zero,
+                            style = Stroke(width = 8f),
                         )
+                        drawLine(
+                            color = Color(0xFF666666),
+                            start = Offset(-rPx, 0f),
+                            end = Offset(rPx, 0f),
+                            strokeWidth = 4f,
+                        )
+                        drawLine(
+                            color = Color(0xFF666666),
+                            start = Offset(0f, -rPx),
+                            end = Offset(0f, rPx),
+                            strokeWidth = 4f,
+                        )
+                        val centerCol = if (attacking) Color.White else strokeColor
+                        val centerR = (12f * scale).coerceIn(3f, 22f)
+                        drawCircle(color = centerCol, radius = centerR, center = Offset.Zero)
+                        drawCircle(color = Color.White, radius = 4f, center = Offset(rPx - 8f, 0f))
                     }
                 }
 
                 val pColor = Color(0xFF00E5FF)
                 val eColor = Color(0xFFE040FB)
-                drawTop(
+                drawTopBeyblade(
                     snapshot.enemyX, snapshot.enemyY, snapshot.enemyAngle,
                     snapshot.enemyRadius, eColor, snapshot.collisionFlashB,
+                    snapshot.enemyAttacking,
                 )
-                drawTop(
+                drawTopBeyblade(
                     snapshot.playerX, snapshot.playerY, snapshot.playerAngle,
                     snapshot.playerRadius, pColor, snapshot.collisionFlashA,
+                    snapshot.playerAttacking,
                 )
 
                 for (e in snapshot.effects) {
@@ -202,6 +242,7 @@ fun BattleArena(
                     val io = Offset(cx + im.x * scale, cy + im.y * scale)
                     drawCircle(color = Color.Yellow.copy(alpha = 0.35f * im.age), radius = 8f, center = io)
                 }
+
             }
         }
     }

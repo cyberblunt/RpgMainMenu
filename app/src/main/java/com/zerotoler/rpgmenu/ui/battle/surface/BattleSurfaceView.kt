@@ -3,7 +3,9 @@ package com.zerotoler.rpgmenu.ui.battle.surface
 import android.content.Context
 import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.LinearGradient
 import android.graphics.Paint
+import android.graphics.Shader
 import android.util.AttributeSet
 import android.view.MotionEvent
 import android.view.SurfaceHolder
@@ -18,7 +20,10 @@ class BattleSurfaceView @JvmOverloads constructor(
 ) : SurfaceView(context, attrs), SurfaceHolder.Callback {
 
     private val renderPaint = Paint(Paint.ANTI_ALIAS_FLAG)
-    private val bgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.TRANSPARENT }
+    /** Full-canvas fill matching Compose battle gradient (not transparent — SurfaceView would show black). */
+    private val bgPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+    private var bgShaderW = -1f
+    private var bgShaderH = -1f
 
     private var thread: BattleSurfaceThread? = null
     private var engineRef: AtomicReference<BattleEngine?> = AtomicReference(null)
@@ -31,6 +36,7 @@ class BattleSurfaceView @JvmOverloads constructor(
         // Gameplay should be BEHIND Compose overlays (win/loss, HUD).
         setZOrderOnTop(false)
         holder.setFormat(android.graphics.PixelFormat.TRANSLUCENT)
+        setBackgroundColor(Color.TRANSPARENT)
     }
 
     fun setEngine(engine: BattleEngine?, onSnapshot: ((BattleRenderSnapshot) -> Unit)?) {
@@ -88,13 +94,28 @@ class BattleSurfaceView @JvmOverloads constructor(
     }
 
     private fun drawFrame(canvas: Canvas, snap: BattleRenderSnapshot) {
-        canvas.drawColor(Color.TRANSPARENT, android.graphics.PorterDuff.Mode.CLEAR)
-
-        // Simple renderer: arena + tops + aim line (SurfaceView is gameplay-only; HUD remains Compose).
         val w = canvas.width.toFloat().coerceAtLeast(1f)
         val h = canvas.height.toFloat().coerceAtLeast(1f)
+        if (w != bgShaderW || h != bgShaderH) {
+            bgShaderW = w
+            bgShaderH = h
+            bgPaint.shader = LinearGradient(
+                0f,
+                0f,
+                0f,
+                h,
+                Color.parseColor("#0A1628"),
+                Color.parseColor("#050D18"),
+                Shader.TileMode.CLAMP,
+            )
+        }
+        bgPaint.style = Paint.Style.FILL
+        canvas.drawRect(0f, 0f, w, h, bgPaint)
+
+        // Simple renderer: arena + tops + aim line (SurfaceView is gameplay-only; HUD remains Compose).
         val minSide = kotlin.math.min(w, h)
-        val arenaRadiusPx = minSide * 0.48f
+        // Matches [BattleEngine.arenaRadius] (sim ↔ pixels).
+        val arenaRadiusPx = minSide * 0.45f * 1.1f * 3.5f / 3f * 0.95f
         val scale = arenaRadiusPx / snap.arenaRadius.coerceAtLeast(0.25f)
         val cx = w * 0.5f + snap.screenShakeX
         val cy = h * 0.5f + snap.screenShakeY
@@ -118,31 +139,56 @@ class BattleSurfaceView @JvmOverloads constructor(
         renderPaint.color = Color.argb(120, 0, 229, 255)
         canvas.drawCircle(cx, cy, arenaR, renderPaint)
 
-        fun drawTop(px: Float, py: Float, r: Float, color: Int) {
-            val x = cx + px * scale
-            val y = cy + py * scale
+        if (snap.particles.isNotEmpty()) {
             renderPaint.style = Paint.Style.FILL
-            renderPaint.color = color
-            canvas.drawCircle(x, y, (r * scale).coerceAtLeast(4f), renderPaint)
+            for (pt in snap.particles) {
+                val px = cx + pt.x * scale
+                val py = cy + pt.y * scale
+                val life = pt.life.coerceIn(0f, 1f)
+                val baseA = (pt.colorArgb ushr 24) and 0xff
+                val alpha = (baseA * life).toInt().coerceIn(0, 255)
+                val rgb = pt.colorArgb and 0x00FFFFFF
+                renderPaint.color = (alpha shl 24) or rgb
+                val pr = (pt.size * scale).coerceIn(1.5f, 18f)
+                canvas.drawCircle(px, py, pr, renderPaint)
+            }
         }
 
-        fun drawSpinMarker(px: Float, py: Float, r: Float, angleRad: Float, color: Int) {
-            val x = cx + px * scale
-            val y = cy + py * scale
-            val rr = (r * scale).coerceAtLeast(4f)
-            val ex = x + kotlin.math.cos(angleRad) * rr * 0.85f
-            val ey = y + kotlin.math.sin(angleRad) * rr * 0.85f
+        fun drawTopBeyblade(px: Float, py: Float, r: Float, angleRad: Float, colorArgb: Int, attacking: Boolean) {
+            val topX = cx + px * scale
+            val topY = cy + py * scale
+            val radiusPx = (r * scale).coerceAtLeast(4f)
+            canvas.save()
+            canvas.translate(topX, topY)
+            canvas.rotate(Math.toDegrees(angleRad.toDouble()).toFloat())
+            renderPaint.style = Paint.Style.FILL
+            renderPaint.color = Color.parseColor("#222222")
+            canvas.drawCircle(0f, 0f, radiusPx, renderPaint)
             renderPaint.style = Paint.Style.STROKE
-            renderPaint.strokeWidth = (2.5f + rr * 0.08f).coerceIn(2.5f, 7f)
-            renderPaint.color = Color.WHITE
-            canvas.drawLine(x, y, ex, ey, renderPaint)
+            renderPaint.strokeWidth = 8f
+            renderPaint.color = colorArgb
+            canvas.drawCircle(0f, 0f, radiusPx, renderPaint)
+            renderPaint.color = Color.parseColor("#666666")
+            renderPaint.strokeWidth = 4f
+            canvas.drawLine(-radiusPx, 0f, radiusPx, 0f, renderPaint)
+            canvas.drawLine(0f, -radiusPx, 0f, radiusPx, renderPaint)
             renderPaint.style = Paint.Style.FILL
-            renderPaint.color = color
-            canvas.drawCircle(x, y, rr, renderPaint)
+            renderPaint.color = if (attacking) Color.WHITE else colorArgb
+            val centerR = (12f * scale).coerceIn(3f, 22f)
+            canvas.drawCircle(0f, 0f, centerR, renderPaint)
+            renderPaint.color = Color.WHITE
+            canvas.drawCircle(radiusPx - 8f, 0f, 4f, renderPaint)
+            canvas.restore()
         }
 
-        drawSpinMarker(snap.enemyX, snap.enemyY, snap.enemyRadius, snap.enemyAngle, Color.argb(220, 224, 64, 251))
-        drawSpinMarker(snap.playerX, snap.playerY, snap.playerRadius, snap.playerAngle, Color.argb(220, 0, 229, 255))
+        drawTopBeyblade(
+            snap.enemyX, snap.enemyY, snap.enemyRadius, snap.enemyAngle,
+            Color.argb(220, 224, 64, 251), snap.enemyAttacking,
+        )
+        drawTopBeyblade(
+            snap.playerX, snap.playerY, snap.playerRadius, snap.playerAngle,
+            Color.argb(220, 0, 229, 255), snap.playerAttacking,
+        )
 
         if (snap.phase == com.zerotoler.rpgmenu.domain.model.battle.BattlePhase.LAUNCH && snap.aimActive) {
             val sx = cx + snap.playerX * scale

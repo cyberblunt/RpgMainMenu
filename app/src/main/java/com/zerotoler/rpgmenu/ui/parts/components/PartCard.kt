@@ -70,7 +70,7 @@ fun PartCard(
                 onClick = onEquip,
             )
             .alpha(if (enabled) 1f else 0.45f)
-            .padding(7.dp),
+            .padding(5.dp),
     ) {
         Row(
             modifier = Modifier.fillMaxWidth(),
@@ -112,7 +112,7 @@ fun PartCard(
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(top = 8.dp)
-                .height(52.dp),
+                .height(44.dp),
             contentAlignment = Alignment.Center,
         ) {
             Text(

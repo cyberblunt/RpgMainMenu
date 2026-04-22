@@ -30,6 +30,8 @@ fun PlaceholderScreen(
     title: String,
     description: String = "This is a prototype destination. Hook your feature flow here.",
     onBack: () -> Unit,
+    primaryActionLabel: String? = null,
+    onPrimaryAction: (() -> Unit)? = null,
 ) {
     BackHandler(onBack = onBack)
 
@@ -79,6 +81,19 @@ fun PlaceholderScreen(
                         .fillMaxWidth(0.92f)
                         .padding(top = 16.dp),
                 )
+                if (primaryActionLabel != null && onPrimaryAction != null) {
+                    Button(
+                        onClick = onPrimaryAction,
+                        modifier = Modifier.padding(top = 24.dp),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = PanelBlue,
+                            contentColor = MaterialTheme.colorScheme.onSurface,
+                        ),
+                        shape = RoundedCornerShape(10.dp),
+                    ) {
+                        Text(primaryActionLabel)
+                    }
+                }
             }
         }
     }

@@ -22,10 +22,10 @@ class BuildBattleTopFromSelectedLoadoutUseCase(
     private val computeBuildStatsUseCase: ComputeBuildStatsUseCase,
 ) {
     private companion object {
-        // Gameplay requirement: tops on the arena must become 3x larger.
-        const val TOP_RADIUS_SCALE = 3f
-        const val MIN_TOP_RADIUS = 0.18f // ~= 0.06f * 3
-        const val MAX_TOP_RADIUS = 0.35f // safety clamp for stable spawn/bounce inside arena
+        /** Arena radius in sim space is ~1.0; tops stay small (~0.08) for correct HUD/arena proportions. */
+        const val TOP_RADIUS_SCALE = 1f
+        const val MIN_TOP_RADIUS = 0.06f
+        const val MAX_TOP_RADIUS = 0.11f
     }
 
 
@@ -221,11 +221,11 @@ class BuildBattleTopFromSelectedLoadoutUseCase(
         }
         val wG = weightGrams.coerceIn(32.5f, 54.5f)
         val mass = (wG * massMul / 50f).coerceIn(0.65f, 2.1f)
-        val baseRadius = (0.055f + sqrt(mass.toDouble()).toFloat() * 0.028f).coerceIn(0.06f, 0.11f)
+        val baseRadius = (0.065f + sqrt(mass.toDouble()).toFloat() * 0.012f).coerceIn(0.072f, 0.095f)
         val radius = (baseRadius * TOP_RADIUS_SCALE).coerceIn(MIN_TOP_RADIUS, MAX_TOP_RADIUS)
         val maxHp = baseHealth.coerceIn(40f, 220f)
         val maxStm = (baseStm * 4.5f).coerceIn(55f, 200f)
-        val stabilization = stabilizationLevelFor(driverClass = driverClass, ringClass = ringClass)
+        val stabilization = stabilizationLevelFor(driverClass, ringClass)
         return BattleTopStats(
             id = id,
             owner = owner,
@@ -248,18 +248,18 @@ class BuildBattleTopFromSelectedLoadoutUseCase(
         )
     }
 
-    private fun stabilizationLevelFor(driverClass: DriverClass, ringClass: RingClass): StabilizationLevel {
-        return when (driverClass) {
-            DriverClass.CENTRAL -> StabilizationLevel.CENTER
-            DriverClass.CIRCLE -> when (ringClass) {
-                RingClass.INNER, RingClass.BALANCED -> StabilizationLevel.INNER_RING
-                RingClass.OUTER, RingClass.IMBALANCED -> StabilizationLevel.OUTER_RING
-                RingClass.UNKNOWN -> StabilizationLevel.INNER_RING
-            }
-            DriverClass.UNKNOWN -> when (ringClass) {
-                RingClass.OUTER, RingClass.IMBALANCED -> StabilizationLevel.OUTER_RING
-                else -> StabilizationLevel.INNER_RING
+}
+
+private fun stabilizationLevelFor(driverClass: DriverClass, ringClass: RingClass): StabilizationLevel {
+    return when (driverClass) {
+        DriverClass.CENTRAL -> StabilizationLevel.CENTER
+        DriverClass.CIRCLE -> {
+            if (ringClass == RingClass.INNER || ringClass == RingClass.BALANCED) {
+                StabilizationLevel.INNER_RING
+            } else {
+                StabilizationLevel.OUTER_RING
             }
         }
+        else -> StabilizationLevel.CENTER
     }
 }

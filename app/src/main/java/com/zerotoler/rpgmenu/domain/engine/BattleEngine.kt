@@ -1,19 +1,25 @@
 package com.zerotoler.rpgmenu.domain.engine
 
+import android.graphics.Color as AndroidColor
 import com.zerotoler.rpgmenu.domain.model.battle.BattleOutcome
 import com.zerotoler.rpgmenu.domain.model.battle.BattlePhase
+import com.zerotoler.rpgmenu.domain.model.battle.BattleParticle
 import com.zerotoler.rpgmenu.domain.model.battle.BattleRenderSnapshot
 import com.zerotoler.rpgmenu.domain.model.battle.BattleTopStats
 import com.zerotoler.rpgmenu.domain.model.battle.CollisionEffect
 import com.zerotoler.rpgmenu.domain.model.battle.FloatingImpact
+import com.zerotoler.rpgmenu.domain.model.battle.Particle
 import com.zerotoler.rpgmenu.domain.model.battle.StabilizationLevel
 import kotlin.math.PI
 import kotlin.math.abs
 import kotlin.math.cos
+import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.pow
 import kotlin.math.roundToInt
 import kotlin.math.sin
 import kotlin.math.sqrt
+import org.dyn4j.collision.CategoryFilter
 import org.dyn4j.dynamics.Body
 import org.dyn4j.dynamics.BodyFixture
 import org.dyn4j.geometry.Circle
@@ -33,13 +39,19 @@ class BattleEngine(
     private val sessionSeed: Int,
     private val roundIndex: Int,
 ) {
-    private val arenaRadius = 1.0
+    /** Normalized arena radius: base ring scale, then −5% visual/physics tuning. */
+    private val arenaRadius = 1.1 * 3.5 / 3.0 * 0.95
+    /** HTML reference arena radius (px); maps constants to this sim space without resizing tops. */
+    private val htmlArenaRadius = 350.0
+    private val scaleFactor = arenaRadius / htmlArenaRadius
+    private val referenceHz = 60.0
     private val world: World<Body> = World()
 
     private val playerBody: Body
     private val enemyBody: Body
 
-    private val topRadiusScale = 0.7
+    /** Linear scale on [BattleTopStats.radius] (0.7× base, 5× boost, prior tweaks, then +15% diameter). */
+    private val topRadiusScale = 0.7 * 5.0 * 0.75 * 0.7 * 1.15
 
     private var battlePhase = BattlePhase.LAUNCH
     private var battleOutcome = BattleOutcome.NONE
@@ -71,36 +83,27 @@ class BattleEngine(
     /** Вращение: прежняя логика — срез только когда стамина не выше 40% от макс. */
     private val staminaSpinMotionThreshold = 0.4
 
-    // --- Beyblade-style stabilization rings (relative to arena radius) ---
-    private val innerRingRadius = arenaRadius * 0.37
-    private val outerRingRadius = arenaRadius * 0.74
-
     // --- JS-reference behavior constants (time-based, stable at 60Hz) ---
     private val attackDurationSec = 1.0
-    private val globalFriction = 0.998
-    /** After overspeed, scale velocity toward cap (preserves direction); avoids repeated 0.94 "spiral" drain. */
-    private val overspeedSoftClamp = true
-    private val baseMaxSpeed = 3.2 // sim-space; launch speed is ~[0.9..3.2]
+    /** Low friction, scaled per second for 60Hz reference (matches HTML-style drift). */
+    private val globalFrictionPerSec = 0.998
+    /** Strong friction exponent base when over speed cap (per-second at 60Hz). */
+    private val overspeedFrictionPerSec = 0.94
+    /** Speed cap baseline in sim units (HTML: 11.2 px/frame @60Hz, scaled to arena). */
+    private val baseMaxSpeed = 11.2 * scaleFactor * referenceHz
     private val attackSpeedCapMul = 1.5
     private val attackBurstMul = 2.0
-    private val attackMagnetismBase = 0.5
-    private val attackMagnetismRamp = 0.7
-    private val stabilizationWeakenDuringAttack = 0.25
+    /** Magnetism as acceleration (m/s²): starts ~5.14, ramps by ~7.2 over attack window (HTML-derived). */
     private val spinSpeedRef = 55.0 // "full spin" reference (rad/s)
     private val staminaDrainPerSecAtFullSpin = 2.8 // tuned: ~35s for maxStamina~100 at high spin
-    private val collisionDamagePerSpeed = 12.0 // JS: impactSpeed * 0.5 (pixel units); scaled for sim-space
-    private val collisionDamageMin = 1.0
-    private val collisionSpinPenalty = 3.0 // rad/s subtracted from the slower top on impact
-
-    /** Inner/outer ring groove stabilization: +70% force vs previous tuning ([CENTER] unchanged). */
-    private val ringStabilizationForceMul = 1.7
-
     /** Keep attack-level speed cap briefly after dash ends so linear clamp + stamina caps don't eat momentum. */
     private val postAttackSpeedCapRelaxSec = 0.85
 
     // --- Lightweight visual effects buffers (only allocate on events) ---
     private val effects = ArrayList<CollisionEffect>(32)
     private val impacts = ArrayList<FloatingImpact>(16)
+    private val particles = ArrayList<Particle>(96)
+    private val maxParticles = 120
 
     init {
         world.gravity = Vector2(0.0, 0.0)
@@ -118,6 +121,10 @@ class BattleEngine(
         world.addBody(playerBody)
         world.addBody(enemyBody)
     }
+
+    /** Optional hook for UI (e.g. extra Compose particles). */
+    var onBattleCollision: ((worldX: Double, worldY: Double, relativeSpeed: Float, isAttackClash: Boolean) -> Unit)? =
+        null
 
     fun currentPhase(): BattlePhase = battlePhase
     fun currentOutcome(): BattleOutcome = battleOutcome
@@ -142,7 +149,7 @@ class BattleEngine(
         if (battlePhase != BattlePhase.LAUNCH || !aiming) return
         aiming = false
 
-        val linearSpeed = lerp(1.0, 3.2, aimPower01)
+        val linearSpeed = lerp(0.5, 1.92, aimPower01)
         val spin = lerp(18.0, 55.0, aimPower01) // rad/s-ish; used as angular velocity directly
 
         playerBody.applyImpulse(
@@ -164,11 +171,18 @@ class BattleEngine(
             Vector2(lx / ll, ly / ll)
         }
         val epow = (0.35 + pseudoRandom(seed, 2) * 0.55).coerceIn(0.0, 1.0)
-        val elinear = lerp(0.9, 2.7, epow)
+        val elinear = lerp(0.45, 1.75, epow)
         val espin = lerp(14.0, 48.0, epow)
         enemyBody.applyImpulse(Vector2(edir.x * enemyBase.mass.toDouble() * elinear, edir.y * enemyBase.mass.toDouble() * elinear))
         enemyBody.setAngularVelocity(espin)
         seedMotionPeaksFromBody(enemyBody)
+
+        (playerBody.userData as? TopRuntime)?.let { rt ->
+            rt.spinSpeed = (abs(spin) / spinSpeedRef * 1.5).coerceIn(0.35, 2.4)
+        }
+        (enemyBody.userData as? TopRuntime)?.let { rt ->
+            rt.spinSpeed = (abs(espin) / spinSpeedRef * 1.5).coerceIn(0.35, 2.4)
+        }
 
         battlePhase = BattlePhase.ACTIVE
     }
@@ -192,20 +206,22 @@ class BattleEngine(
 
         battleTimeSec -= d
 
-        // Physics step (fixed 60Hz externally, but we still clamp).
-        world.step(1)
-
-        // Beyblade-style behavior layers on top of Dyn4j resolution.
+        // Arcade steering + attacks apply as velocity changes *before* integration so Dyn4j does not
+        // double-integrate the same impulses. Top–top overlap uses manual HTML-style resolution (no Dyn4j contact).
         manageAttacks(d)
-        applyAttackAndStabilization(playerBody, enemyBody, d)
-        applyAttackAndStabilization(enemyBody, playerBody, d)
+        applyMagnetismAndStabilization(playerBody, enemyBody, d)
+        applyMagnetismAndStabilization(enemyBody, playerBody, d)
+
+        world.step(1)
 
         // Hard arena boundary bounce to prevent rim "gliding"
         enforceArenaBounce(playerBody, playerRadius())
         enforceArenaBounce(enemyBody, enemyRadius())
+        applyManualTopContact()
         tickEffects(d.toFloat())
         drainStaminaFromSpin(d)
-        applyHpDamageIfContact()
+        updatePhysicsAndStamina(playerBody, d)
+        updatePhysicsAndStamina(enemyBody, d)
         // После расхода стамины (дрейн + удары) привязываем скорости к стамине
         applyStaminaMotionCoupling(playerBody, playerStam, playerBase.maxStamina.toDouble())
         applyStaminaMotionCoupling(enemyBody, enemyStam, enemyBase.maxStamina.toDouble())
@@ -223,6 +239,29 @@ class BattleEngine(
 
         val effectsSnapshot = if (effects.isEmpty()) emptyList() else effects.toList()
         val impactsSnapshot = if (impacts.isEmpty()) emptyList() else impacts.toList()
+        val particlesSnapshot =
+            if (particles.isEmpty()) {
+                emptyList()
+            } else {
+                particles.map {
+                    BattleParticle(
+                        it.x.toFloat(),
+                        it.y.toFloat(),
+                        min(1.0, it.life).toFloat(),
+                        it.size.toFloat(),
+                        it.color,
+                    )
+                }
+            }
+
+        val pr = playerBody.userData as? TopRuntime
+        val er = enemyBody.userData as? TopRuntime
+        val spin01P = ((pr?.spinSpeed ?: (pOmega / spinSpeedRef * 1.5)) / 1.5).toFloat().coerceIn(0f, 1.15f)
+        val spin01E = ((er?.spinSpeed ?: (eOmega / spinSpeedRef * 1.5)) / 1.5).toFloat().coerceIn(0f, 1.15f)
+        val pRpmMax = playerBase.maxStamina.toInt().coerceAtLeast(1)
+        val eRpmMax = enemyBase.maxStamina.toInt().coerceAtLeast(1)
+        val playerRpm = (spin01P * pRpmMax).roundToInt().coerceIn(0, pRpmMax + (pRpmMax * 0.15f).roundToInt())
+        val enemyRpm = (spin01E * eRpmMax).roundToInt().coerceIn(0, eRpmMax + (eRpmMax * 0.15f).roundToInt())
 
         return BattleRenderSnapshot(
             tick = tickCount,
@@ -266,6 +305,19 @@ class BattleEngine(
             screenShakeY = 0f,
             effects = effectsSnapshot,
             impacts = impactsSnapshot,
+            particles = particlesSnapshot,
+            playerRpm = playerRpm,
+            enemyRpm = enemyRpm,
+            playerRpmMax = pRpmMax,
+            enemyRpmMax = eRpmMax,
+            playerAttacking = pr?.isAttacking == true,
+            enemyAttacking = er?.isAttacking == true,
+            playerAttack = playerBase.attack.roundToInt().coerceAtLeast(0),
+            playerDefense = playerBase.defense.roundToInt().coerceAtLeast(0),
+            playerWeightGrams = playerBase.weightGrams.roundToInt(),
+            enemyAttack = enemyBase.attack.roundToInt().coerceAtLeast(0),
+            enemyDefense = enemyBase.defense.roundToInt().coerceAtLeast(0),
+            enemyWeightGrams = enemyBase.weightGrams.roundToInt(),
             playerArchetype = playerBase.archetype,
             enemyArchetype = enemyBase.archetype,
         )
@@ -384,82 +436,142 @@ class BattleEngine(
         }
     }
 
-    private fun applyHpDamageIfContact() {
+    /**
+     * HTML-style overlap: separate centers, elastic bounce with [bounceForce], HP on cooldown, spin tradeoff.
+     * Dyn4j top–top collision is disabled via [CategoryFilter]; this runs after [world.step].
+     */
+    private fun applyManualTopContact() {
         if (battlePhase != BattlePhase.ACTIVE) return
-        if (!playerBody.isEnabled || !enemyBody.isEnabled) return
+        val t1 = playerBody
+        val t2 = enemyBody
+        val rt1 = t1.userData as? TopRuntime ?: return
+        val rt2 = t2.userData as? TopRuntime ?: return
+        if (!t1.isEnabled || !t2.isEnabled) return
 
-        // Cheap contact test: distance threshold in sim space.
-        val pPos = playerBody.transform.translation
-        val ePos = enemyBody.transform.translation
-        val dx = ePos.x - pPos.x
-        val dy = ePos.y - pPos.y
-        val dist2 = dx * dx + dy * dy
-        val minDist = (playerBase.radius.toDouble() * topRadiusScale) + (enemyBase.radius.toDouble() * topRadiusScale)
-        if (dist2 > (minDist * 1.04) * (minDist * 1.04)) return
+        val p1 = t1.transform.translation
+        val p2 = t2.transform.translation
+        val dx = p2.x - p1.x
+        val dy = p2.y - p1.y
+        val dist = sqrt(dx * dx + dy * dy).coerceAtLeast(1e-9)
+        val r1 = playerRadius()
+        val r2 = enemyRadius()
+        val minDist = r1 + r2
+        if (dist >= minDist) return
 
-        val pr = playerBody.userData as? TopRuntime ?: return
-        val er = enemyBody.userData as? TopRuntime ?: return
-
-        // Collisions interrupt attacks immediately (required mechanic).
-        if (pr.isAttacking || er.isAttacking) {
-            cancelAttack(pr)
-            cancelAttack(er)
-        }
-
-        val nowMs = System.currentTimeMillis()
-        val key = pairKey(pr.id, er.id)
-        val last = lastDamageMsByPair[key] ?: Long.MIN_VALUE
-        if (nowMs - last < damageCooldownMs) return
-        lastDamageMsByPair[key] = nowMs
-
-        val va = playerBody.linearVelocity
-        val vb = enemyBody.linearVelocity
-        val rvx = va.x - vb.x
-        val rvy = va.y - vb.y
-        val relativeSpeed = sqrt(rvx * rvx + rvy * rvy)
-
-        // JS reference: HP decreases on collision, scaling with impact speed.
-        // We keep i-frames (damageCooldownMs) to avoid micro-frame shredding, but use speed-only damage.
-        val damage = (relativeSpeed * collisionDamagePerSpeed).coerceAtLeast(collisionDamageMin)
-        er.currentHp -= damage
-        pr.currentHp -= damage
-
-        // Small stamina hit on impacts; keeps "big crashes" meaningful without dominating spin decay.
-        val staminaHit = (relativeSpeed * 1.8).coerceIn(0.0, 8.0)
-        er.currentStamina = (er.currentStamina - staminaHit).coerceIn(0.0, er.maxStamina)
-        pr.currentStamina = (pr.currentStamina - staminaHit).coerceIn(0.0, pr.maxStamina)
-
-        // Small post-impact "wobble" to reflect heavy-vs-light deviation:
-        // light gets pushed more; heavy gets a minor deflection.
-        val totalMass = (pr.mass + er.mass).coerceAtLeast(1e-6)
-        val prMass01 = (pr.mass / totalMass).coerceIn(0.05, 0.95)
-        val erMass01 = 1.0 - prMass01
-        val dist = sqrt(dist2).coerceAtLeast(1e-9)
         val nx = dx / dist
         val ny = dy / dist
-        val impulseScale = (0.025 + relativeSpeed * 0.008).coerceIn(0.0, 0.12)
-        // Light receives more of the impulse.
-        val toEnemy = impulseScale * (0.35 + 0.9 * prMass01)
-        val toPlayer = impulseScale * (0.35 + 0.9 * erMass01)
-        enemyBody.applyImpulse(Vector2(nx * toEnemy, ny * toEnemy))
-        playerBody.applyImpulse(Vector2(-nx * toPlayer, -ny * toPlayer))
 
-        emitImpactSparks(x = (pPos.x + ePos.x) * 0.5, y = (pPos.y + ePos.y) * 0.5, intensity = relativeSpeed.toFloat())
+        val clashAttack = rt1.isAttacking || rt2.isAttacking
+        cancelAttack(rt1)
+        cancelAttack(rt2)
 
-        // JS reference: spin penalty on collision to the weaker/slower-spinning top.
-        val pOmega = abs(playerBody.angularVelocity)
-        val eOmega = abs(enemyBody.angularVelocity)
-        if (pOmega > eOmega) {
-            val newAbs = (eOmega - collisionSpinPenalty).coerceAtLeast(0.0)
-            enemyBody.setAngularVelocity(if (enemyBody.angularVelocity >= 0.0) newAbs else -newAbs)
-        } else {
-            val newAbs = (pOmega - collisionSpinPenalty).coerceAtLeast(0.0)
-            playerBody.setAngularVelocity(if (playerBody.angularVelocity >= 0.0) newAbs else -newAbs)
+        val overlap = minDist - dist
+        t1.translate(-nx * overlap / 2.0, -ny * overlap / 2.0)
+        t2.translate(nx * overlap / 2.0, ny * overlap / 2.0)
+
+        val v1 = t1.linearVelocity
+        val v2 = t2.linearVelocity
+        val kx = v1.x - v2.x
+        val ky = v1.y - v2.y
+        val relativeSpeed = sqrt(kx * kx + ky * ky)
+
+        val m1 = t1.mass.mass.coerceAtLeast(0.05)
+        val m2 = t2.mass.mass.coerceAtLeast(0.05)
+        val p = 2.0 * (nx * kx + ny * ky) / (m1 + m2)
+        val bounceForce = 1.05
+        t1.setLinearVelocity(
+            (v1.x - p * m2 * nx) * bounceForce,
+            (v1.y - p * m2 * ny) * bounceForce,
+        )
+        t2.setLinearVelocity(
+            (v2.x + p * m1 * nx) * bounceForce,
+            (v2.y + p * m1 * ny) * bounceForce,
+        )
+
+        val impactSpeed = relativeSpeed / (scaleFactor * referenceHz).coerceAtLeast(1e-6)
+        createSparks(
+            p1.x + nx * r1,
+            p1.y + ny * r1,
+            AndroidColor.argb(255, 255, 255, 255),
+            impactSpeed * 0.8 + 0.5,
+        )
+
+        if (relativeSpeed >= 0.02) {
+            val nowMs = System.currentTimeMillis()
+            val key = pairKey(rt1.id, rt2.id)
+            val last = lastDamageMsByPair[key] ?: Long.MIN_VALUE
+            if (nowMs - last >= damageCooldownMs) {
+                lastDamageMsByPair[key] = nowMs
+                val baseDamage = relativeSpeed * 100.0
+                val def1 = rt1.defenseStat.coerceAtLeast(1.0)
+                val def2 = rt2.defenseStat.coerceAtLeast(1.0)
+                rt1.currentHp = (rt1.currentHp - baseDamage * (rt2.attackStat / def1)).coerceAtLeast(0.0)
+                rt2.currentHp = (rt2.currentHp - baseDamage * (rt1.attackStat / def2)).coerceAtLeast(0.0)
+            }
         }
 
+        if (rt1.spinSpeed > rt2.spinSpeed) {
+            rt2.spinSpeed = (rt2.spinSpeed - 0.05).coerceAtLeast(0.0)
+        } else {
+            rt1.spinSpeed = (rt1.spinSpeed - 0.05).coerceAtLeast(0.0)
+        }
+
+        onBattleCollision?.invoke(
+            p1.x + nx * r1,
+            p1.y + ny * r1,
+            relativeSpeed.toFloat().coerceIn(0.1f, 8f),
+            clashAttack,
+        )
+
         syncFromRuntime()
-        if (pr.currentHp <= 0.0) killTop(playerBody)
-        if (er.currentHp <= 0.0) killTop(enemyBody)
+        if (rt1.currentHp <= 0.0) killTop(t1)
+        if (rt2.currentHp <= 0.0) killTop(t2)
+    }
+
+    private fun updatePhysicsAndStamina(body: Body, dt: Double) {
+        if (!body.isEnabled) return
+        val rt = body.userData as? TopRuntime ?: return
+        val baseMaxAllowed = baseMaxSpeed * (rt.spinSpeed / 1.5)
+        var maxAllowedSpeed = baseMaxAllowed.coerceAtLeast(0.12)
+        if (rt.isAttacking) maxAllowedSpeed *= attackSpeedCapMul
+        if (simTimeSec < rt.linearSpeedCapBoostUntilSec) {
+            maxAllowedSpeed = maxOf(maxAllowedSpeed, baseMaxAllowed * attackSpeedCapMul)
+        }
+
+        val vel = body.linearVelocity
+        val sp = sqrt(vel.x * vel.x + vel.y * vel.y)
+        val inRingGroove = isRingGrooveStabilizing(body)
+        if (sp > maxAllowedSpeed && maxAllowedSpeed > 0.1) {
+            body.setLinearVelocity(
+                vel.x * overspeedFrictionPerSec.pow(dt * referenceHz),
+                vel.y * overspeedFrictionPerSec.pow(dt * referenceHz),
+            )
+        } else if (!inRingGroove) {
+            body.setLinearVelocity(
+                vel.x * globalFrictionPerSec.pow(dt * referenceHz),
+                vel.y * globalFrictionPerSec.pow(dt * referenceHz),
+            )
+        }
+        val vel2 = body.linearVelocity
+        val sp2 = sqrt(vel2.x * vel2.x + vel2.y * vel2.y)
+        if (sp2 > maxAllowedSpeed && maxAllowedSpeed > 1e-6) {
+            val k = maxAllowedSpeed / sp2
+            body.setLinearVelocity(vel2.x * k, vel2.y * k)
+        }
+
+        rt.spinSpeed -= 0.009 * dt
+        if (rt.spinSpeed <= 0.0) {
+            rt.spinSpeed = 0.0
+            val pos = body.transform.translation
+            val c =
+                if (body === playerBody) {
+                    AndroidColor.argb(255, 0, 229, 255)
+                } else {
+                    AndroidColor.argb(255, 224, 64, 251)
+                }
+            createSparks(pos.x, pos.y, c, 2.0)
+            killTop(body)
+        }
     }
 
     private fun resolveBattleEnd() {
@@ -493,6 +605,20 @@ class BattleEngine(
     private fun playerRadius(): Double = playerBase.radius.toDouble() * topRadiusScale
     private fun enemyRadius(): Double = enemyBase.radius.toDouble() * topRadiusScale
 
+    /** True when inner/outer ring stabilization is actively steering (not in the center pocket). */
+    private fun isRingGrooveStabilizing(body: Body): Boolean {
+        val rt = body.userData as? TopRuntime ?: return false
+        if (rt.stabilization != StabilizationLevel.INNER_RING && rt.stabilization != StabilizationLevel.OUTER_RING) {
+            return false
+        }
+        val p = body.transform.translation
+        val distCenter = sqrt(p.x * p.x + p.y * p.y).coerceAtLeast(1e-12)
+        val topRadius = (body.fixtures.firstOrNull()?.shape as? Circle)?.radius ?: return false
+        if (distCenter < topRadius * 1.2) return false
+        if (distCenter <= 0.1 * scaleFactor) return false
+        return true
+    }
+
     private fun enforceArenaBounce(body: Body, radius: Double) {
         if (!body.isEnabled) return
         val rt = body.userData as? TopRuntime
@@ -524,25 +650,19 @@ class BattleEngine(
             body.translate(nx * (targetD - d), ny * (targetD - d))
         }
 
-        val e = 0.92
+        val e = 1.05
         var vx = body.linearVelocity.x
         var vy = body.linearVelocity.y
         val vn2 = vx * nx + vy * ny
 
-        // Bounce on outward impacts. Only strip tangential slip on true penetration (pastRing),
-        // otherwise a clean boundary hit would "dead-stop" due to over-aggressive tangential damping.
         if (vn2 > 0.0) {
-            // Bounce if moving outward through the boundary
             vx -= (1.0 + e) * vn2 * nx
             vy -= (1.0 + e) * vn2 * ny
-
             if (pastRing) {
-                // Strip some tangential slip only when we actually penetrated the ring.
                 val vnAfter = vx * nx + vy * ny
                 val tx = -ny
                 val ty = nx
                 val vt = vx * tx + vy * ty
-                // Higher wallGrip (and heavier weight) retains a bit more tangential velocity.
                 val grip = (rt?.wallGrip ?: 1.0).coerceIn(0.75, 1.35)
                 val massN = (rt?.mass ?: 1.0).coerceIn(0.65, 2.1)
                 val tangentialRetain =
@@ -550,14 +670,16 @@ class BattleEngine(
                 vx = nx * vnAfter + tx * vt * tangentialRetain
                 vy = ny * vnAfter + ty * vt * tangentialRetain
             }
-
             body.setLinearVelocity(vx, vy)
+            if (pastRing && rt != null) {
+                rt.spinSpeed = (rt.spinSpeed - 0.005).coerceAtLeast(0.0)
+                val tp = body.transform.translation
+                createSparks(tp.x + nx * radius, tp.y + ny * radius, AndroidColor.argb(255, 0, 255, 255), 1.5)
+            }
         } else if (pastRing) {
-            // If we got pushed slightly past the ring but are already moving inward, just keep velocity.
             body.setLinearVelocity(vx, vy)
         }
 
-        // Wall hit costs some stamina/spin. Kept modest to avoid wall-dominant outcomes.
         if (pastRing && rt != null && vn2 > 0.0) {
             val impact = vn2
             val spinPenalty = (0.22 + impact * 0.08) * (2.1 / rt.mass.coerceAtLeast(0.65))
@@ -576,7 +698,9 @@ class BattleEngine(
         val fx = BodyFixture(circle).apply {
             this.density = density
             this.friction = 0.45
-            this.restitution = 0.62
+            this.restitution = 1.05
+            // category=1, mask=2 → no top–top Dyn4j contact; overlaps resolved in [applyManualTopContact].
+            this.filter = CategoryFilter(1, 2)
         }
         b.addFixture(fx)
         b.setMass(MassType.NORMAL)
@@ -602,7 +726,9 @@ class BattleEngine(
             hasAttackedThisRound = false,
             isAttacking = false,
             attackTimerSec = initialAttackTimerSec(stats.id.hashCode()),
-            attackElapsedSec = 0.0,
+            attackStartTimeMs = 0L,
+            attackTargetBody = null,
+            spinSpeed = 1.5,
             peakLinearSpeed = 0.0,
             peakAngularSpeed = 0.0,
             linearSpeedCapBoostUntilSec = 0.0,
@@ -655,8 +781,13 @@ class BattleEngine(
         var orbitDirection: Int,
         var hasAttackedThisRound: Boolean,
         var isAttacking: Boolean,
+        /** Seconds until next attack attempt (HTML: 6..10s). */
         var attackTimerSec: Double,
-        var attackElapsedSec: Double,
+        var attackStartTimeMs: Long,
+        /** Dash target (1v1); null when not attacking. */
+        var attackTargetBody: Body?,
+        /** Arcade spin scalar (HTML-style decay via [updatePhysicsAndStamina]). */
+        var spinSpeed: Double,
         /** Peak linear/angular speeds for stamina coupling (updated every frame while enabled). */
         var peakLinearSpeed: Double,
         var peakAngularSpeed: Double,
@@ -664,248 +795,288 @@ class BattleEngine(
         var linearSpeedCapBoostUntilSec: Double,
     )
 
-    private fun initialAttackTimerSec(idHash: Int): Double {
-        // Deterministic 6..10s per top per round seed.
-        val r = pseudoRandom(sessionSeed xor idHash, 97).coerceIn(0.0, 1.0)
-        return 6.0 + r * 4.0
-    }
+    private fun initialAttackTimerSec(idHash: Int): Double =
+        6.0 + pseudoRandom(sessionSeed xor idHash, 97) * 4.0
 
-    private fun nextAttackTimerSec(rt: TopRuntime, salt: Int): Double {
-        val r = pseudoRandom((sessionSeed xor rt.id.toInt()), salt).coerceIn(0.0, 1.0)
-        return 6.0 + r * 4.0
-    }
+    private fun nextAttackTimerSec(rt: TopRuntime, salt: Int): Double =
+        6.0 + pseudoRandom(sessionSeed xor rt.id.toInt(), salt) * 4.0
 
     private fun manageAttacks(dt: Double) {
         if (battlePhase != BattlePhase.ACTIVE) return
         val pr = playerBody.userData as? TopRuntime ?: return
         val er = enemyBody.userData as? TopRuntime ?: return
-        if (!playerBody.isEnabled || !enemyBody.isEnabled) {
+        val pAlive = playerBody.isEnabled
+        val eAlive = enemyBody.isEnabled
+        if (!pAlive || !eAlive) {
             cancelAttack(pr)
             cancelAttack(er)
             return
         }
+
+        fun endAttackIfExpired(rt: TopRuntime) {
+            if (!rt.isAttacking) return
+            val elapsed = (System.currentTimeMillis() - rt.attackStartTimeMs) / 1000.0
+            if (elapsed >= attackDurationSec) {
+                rt.isAttacking = false
+                rt.attackTargetBody = null
+                rt.attackStartTimeMs = 0L
+                rt.linearSpeedCapBoostUntilSec = simTimeSec + postAttackSpeedCapRelaxSec
+            }
+        }
+        endAttackIfExpired(pr)
+        endAttackIfExpired(er)
+
         val roundOver = pr.hasAttackedThisRound && !pr.isAttacking && er.hasAttackedThisRound && !er.isAttacking
         if (roundOver) {
             pr.hasAttackedThisRound = false
             er.hasAttackedThisRound = false
             pr.attackTimerSec = nextAttackTimerSec(pr, salt = 101)
             er.attackTimerSec = nextAttackTimerSec(er, salt = 103)
-        } else {
-            // Tick down only if not already attacking
-            if (!pr.isAttacking && !pr.hasAttackedThisRound) pr.attackTimerSec -= dt
-            if (!er.isAttacking && !er.hasAttackedThisRound) er.attackTimerSec -= dt
+            return
+        }
+
+        if (!pr.isAttacking && !pr.hasAttackedThisRound) {
+            pr.attackTimerSec -= dt
+            if (pr.attackTimerSec <= 0.0 && enemyBody.isEnabled) {
+                pr.isAttacking = true
+                pr.hasAttackedThisRound = true
+                pr.attackStartTimeMs = System.currentTimeMillis()
+                pr.attackTargetBody = enemyBody
+                val v = playerBody.linearVelocity
+                playerBody.setLinearVelocity(v.x * attackBurstMul, v.y * attackBurstMul)
+                emitAttackTrail(playerBody.transform.translation.x, playerBody.transform.translation.y, intensity = 0.9f)
+                emitParticleBurst(
+                    x = playerBody.transform.translation.x,
+                    y = playerBody.transform.translation.y,
+                    colorArgb = AndroidColor.argb(230, 255, 255, 255),
+                    count = 18,
+                    speedMul = 1.35,
+                    salt = 4200,
+                )
+            }
+        }
+        if (!er.isAttacking && !er.hasAttackedThisRound) {
+            er.attackTimerSec -= dt
+            if (er.attackTimerSec <= 0.0 && playerBody.isEnabled) {
+                er.isAttacking = true
+                er.hasAttackedThisRound = true
+                er.attackStartTimeMs = System.currentTimeMillis()
+                er.attackTargetBody = playerBody
+                val v = enemyBody.linearVelocity
+                enemyBody.setLinearVelocity(v.x * attackBurstMul, v.y * attackBurstMul)
+                emitAttackTrail(enemyBody.transform.translation.x, enemyBody.transform.translation.y, intensity = 0.9f)
+                emitParticleBurst(
+                    x = enemyBody.transform.translation.x,
+                    y = enemyBody.transform.translation.y,
+                    colorArgb = AndroidColor.argb(230, 255, 255, 255),
+                    count = 18,
+                    speedMul = 1.35,
+                    salt = 4201,
+                )
+            }
         }
     }
 
     private fun cancelAttack(rt: TopRuntime) {
         val wasAttacking = rt.isAttacking
         rt.isAttacking = false
-        rt.attackElapsedSec = 0.0
+        rt.attackTargetBody = null
+        rt.attackStartTimeMs = 0L
         if (wasAttacking) {
             rt.linearSpeedCapBoostUntilSec = simTimeSec + postAttackSpeedCapRelaxSec
         }
     }
 
-    private fun applyAttackAndStabilization(self: Body, enemy: Body, dt: Double) {
+    private fun applyMagnetismAndStabilization(self: Body, enemy: Body, dt: Double) {
         if (!self.isEnabled) return
         val rt = self.userData as? TopRuntime ?: return
         val et = enemy.userData as? TopRuntime
 
-        // Attack initiation (periodic).
-        if (!rt.hasAttackedThisRound && !rt.isAttacking && enemy.isEnabled && et != null && rt.attackTimerSec <= 0.0) {
-            rt.isAttacking = true
-            rt.hasAttackedThisRound = true
-            rt.attackElapsedSec = 0.0
-            // Burst dash (interruptible by collision handling).
-            val v = self.linearVelocity
-            self.setLinearVelocity(v.x * attackBurstMul, v.y * attackBurstMul)
-            emitAttackTrail(self.transform.translation.x, self.transform.translation.y, intensity = 0.9f)
-        }
-
-        val omegaAbs = abs(self.angularVelocity)
-        val spinRatio = (omegaAbs / spinSpeedRef).coerceIn(0.0, 1.0)
-        // JS: baseMaxSpeed * spinRatio; keep a small floor so exhausted tops still drift a bit.
-        val baseSpinCap = (baseMaxSpeed * spinRatio).coerceAtLeast(0.25)
-        var maxAllowedSpeed = baseSpinCap
-        if (rt.isAttacking) {
-            maxAllowedSpeed *= attackSpeedCapMul
-        } else if (simTimeSec < rt.linearSpeedCapBoostUntilSec) {
-            // Same headroom as during attack so velocity built by dash + magnetism is not stripped the next frames.
-            maxAllowedSpeed = baseSpinCap * attackSpeedCapMul
-        }
-
-        // Attack magnetism (toward nearest enemy; 1v1 => enemy).
-        if (rt.isAttacking && enemy.isEnabled && et != null) {
-            rt.attackElapsedSec += dt
+        val targetBody = rt.attackTargetBody
+        if (rt.isAttacking && enemy.isEnabled && et != null && targetBody != null && targetBody.isEnabled) {
             val p = self.transform.translation
-            val q = enemy.transform.translation
-            val dx = q.x - p.x
-            val dy = q.y - p.y
-            val d = sqrt(dx * dx + dy * dy).coerceAtLeast(1e-9)
-            val nx = dx / d
-            val ny = dy / d
-            val progress = (rt.attackElapsedSec / attackDurationSec).coerceIn(0.0, 1.0)
-            val magnetism = (attackMagnetismBase + progress * attackMagnetismRamp)
+            val q = targetBody.transform.translation
+            val dxT = q.x - p.x
+            val dyT = q.y - p.y
+            val distT = sqrt(dxT * dxT + dyT * dyT).coerceAtLeast(1e-9)
+            val nxT = dxT / distT
+            val nyT = dyT / distT
+            val elapsedSecs = (System.currentTimeMillis() - rt.attackStartTimeMs) / 1000.0
+            val progress = (elapsedSecs / attackDurationSec).coerceIn(0.0, 1.0)
+            val magnetismForceHtml = 0.5 + progress * 0.7
+            // HTML adds this per frame at 60Hz; continuous acceleration = delta-per-frame * 3600.
+            val accelMagnetism = magnetismForceHtml * scaleFactor * 3600.0
+            val v = self.linearVelocity
             self.setLinearVelocity(
-                self.linearVelocity.x + nx * magnetism,
-                self.linearVelocity.y + ny * magnetism,
+                v.x + nxT * accelMagnetism * dt,
+                v.y + nyT * accelMagnetism * dt,
             )
-            if (tickCount % 3L == 0L) {
-                emitAttackTrail(p.x, p.y, intensity = (0.45f + 0.55f * progress.toFloat()))
-            }
-            // End attack after duration.
-            if (rt.attackElapsedSec >= attackDurationSec) {
-                rt.isAttacking = false
-                rt.attackElapsedSec = 0.0
-                rt.linearSpeedCapBoostUntilSec = simTimeSec + postAttackSpeedCapRelaxSec
-            }
+            createSparks(p.x, p.y, AndroidColor.argb(255, 255, 69, 0), 0.5)
         }
 
-        // Stabilization always applies, but is weakened during attack.
-        val stabilizationMul = if (rt.isAttacking) stabilizationWeakenDuringAttack else 1.0
-        applyStabilizationForces(self = self, rt = rt, dt = dt, mul = stabilizationMul)
-
-        // If still over cap after stabilization, scale to cap (direction preserved). Avoid 0.94-per-frame drain.
-        val lv = self.linearVelocity
-        val sp = sqrt(lv.x * lv.x + lv.y * lv.y)
-        if (sp > maxAllowedSpeed && maxAllowedSpeed > 1e-6) {
-            if (overspeedSoftClamp) {
-                val k = maxAllowedSpeed / sp
-                self.setLinearVelocity(lv.x * k, lv.y * k)
-            } else {
-                self.setLinearVelocity(lv.x * 0.94, lv.y * 0.94)
-            }
-        } else {
-            self.setLinearVelocity(lv.x * globalFriction, lv.y * globalFriction)
-        }
+        val stabMul = if (rt.isAttacking) 0.25 else 1.0
+        applyStabilizationForces(self = self, rt = rt, dt = dt, mul = stabMul)
     }
 
     private fun applyStabilizationForces(self: Body, rt: TopRuntime, dt: Double, mul: Double) {
         val p = self.transform.translation
-        val dx = p.x
-        val dy = p.y
-        val dist = sqrt(dx * dx + dy * dy).coerceAtLeast(1e-9)
-        val nx = dx / dist
-        val ny = dy / dist
-        val radius = (self.fixtures.firstOrNull()?.shape as? Circle)?.radius ?: 0.12
-        val inCenterDisableZone = dist < radius * 1.2
-
-        // Higher balanceFactor => steadier stabilization; stamina also affects how well the driver "holds a line".
-        val stam01 = (rt.currentStamina / rt.maxStamina.coerceAtLeast(1e-9)).coerceIn(0.0, 1.0)
-        val balance = rt.balanceFactor.coerceIn(0.65, 1.35)
-        val strength = (mul * (0.82 + 0.18 * stam01) * (0.85 + 0.20 * (balance - 0.65) / 0.70)).coerceIn(0.15, 1.35)
+        val distCenter = sqrt(p.x * p.x + p.y * p.y).coerceAtLeast(1e-12)
+        val nx = p.x / distCenter
+        val ny = p.y / distCenter
+        val topRadius = (self.fixtures.firstOrNull()?.shape as? Circle)?.radius ?: 0.12
+        var vx = self.linearVelocity.x
+        var vy = self.linearVelocity.y
 
         when (rt.stabilization) {
             StabilizationLevel.CENTER -> {
-                // Pull toward center + small deterministic drift (wobble).
-                val centerPull = dist * 2.05 * strength
-                val v = self.linearVelocity
-                var vx = v.x - nx * centerPull * dt
-                var vy = v.y - ny * centerPull * dt
-
-                // More balanced tops wobble less.
-                val drift = (0.22 * strength * (1.15 - 0.35 * (balance - 0.65) / 0.70)).coerceAtLeast(0.05)
-                val rx = pseudoRandom((rt.id.toInt() xor tickCount.toInt()), 7) - 0.5
-                val ry = pseudoRandom((rt.id.toInt() xor tickCount.toInt()), 9) - 0.5
-                vx += rx * drift * dt
-                vy += ry * drift * dt
-
-                // Mild settling friction.
-                self.setLinearVelocity(vx * 0.98, vy * 0.98)
+                if (distCenter > 0.1 * scaleFactor) {
+                    // HTML: -= nx * dist * 0.001 per frame → accel = 0.001 * 3600 * dist = 3.6 * dist
+                    val accelCenter = distCenter * 3.6 * mul
+                    vx -= nx * accelCenter * dt
+                    vy -= ny * accelCenter * dt
+                    // HTML: += (rand-0.5) * 0.05 * scale per frame → 0.05 * 3600 = 180
+                    val driftAccel = 180.0 * scaleFactor * mul
+                    vx += (pseudoRandom(rt.id.toInt() xor tickCount.toInt(), 17) - 0.5) * driftAccel * dt
+                    vy += (pseudoRandom(rt.id.toInt() xor tickCount.toInt(), 23) - 0.5) * driftAccel * dt
+                    val fr = 0.98.pow(dt * referenceHz)
+                    self.setLinearVelocity(vx * fr, vy * fr)
+                }
             }
 
             StabilizationLevel.INNER_RING, StabilizationLevel.OUTER_RING -> {
-                if (inCenterDisableZone) return
-                val ringStrength = strength * ringStabilizationForceMul
-                val rawTargetR = when (rt.stabilization) {
-                    StabilizationLevel.INNER_RING -> innerRingRadius
-                    StabilizationLevel.OUTER_RING -> outerRingRadius
-                    else -> innerRingRadius
+                val centerAreaRadius = topRadius * 1.2
+                if (distCenter >= centerAreaRadius && distCenter > 0.1 * scaleFactor) {
+                    val targetLevel =
+                        if (rt.stabilization == StabilizationLevel.INNER_RING) {
+                            130.0 * scaleFactor
+                        } else {
+                            260.0 * scaleFactor
+                        }
+                    // HTML radial term * 3600: 0.0004 * 3600 = 1.44
+                    val accelRadial = (targetLevel - distCenter) * 1.44 * mul
+                    vx += nx * accelRadial * dt
+                    vy += ny * accelRadial * dt
+
+                    val desiredOrbitSpeed = 7.0 * scaleFactor * referenceHz
+                    val tangentialX = -ny * rt.orbitDirection.toDouble()
+                    val tangentialY = nx * rt.orbitDirection.toDouble()
+                    val currentTangential = vx * tangentialX + vy * tangentialY
+                    // HTML 0.1 per frame → 0.1 * 3600 = 360
+                    val accelOrbit = 360.0 * scaleFactor * mul
+                    if (currentTangential < desiredOrbitSpeed * 0.9) {
+                        vx += tangentialX * accelOrbit * dt
+                        vy += tangentialY * accelOrbit * dt
+                    } else if (currentTangential > desiredOrbitSpeed * 1.1) {
+                        vx -= tangentialX * accelOrbit * 0.5 * dt
+                        vy -= tangentialY * accelOrbit * 0.5 * dt
+                    }
+
+                    val currentSpeed = sqrt(vx * vx + vy * vy)
+                    val accelCentripetal = (currentSpeed * currentSpeed) / distCenter
+                    vx -= nx * accelCentripetal * mul * dt
+                    vy -= ny * accelCentripetal * mul * dt
+                    self.setLinearVelocity(vx, vy)
                 }
-                // Keep groove safely away from the hard rim for large tops; otherwise OUTER_RING degenerates
-                // into repeated wall bounces (looks like "stuck to border" instead of circular trajectory).
-                val maxCenterR = (arenaRadius - radius).coerceAtLeast(0.10)
-                // Match (and exceed) the rim "shell" width used by enforceArenaBounce to avoid entering its brake zone.
-                val rimShell = (radius * 0.08).coerceAtMost(arenaRadius * 0.04).coerceAtLeast(0.02)
-                val rimClearance =
-                    maxOf(
-                        (radius * 0.45),
-                        (rimShell * 2.5),
-                        (arenaRadius * 0.03),
-                        0.02,
-                    )
-                val targetR = rawTargetR.coerceAtMost((maxCenterR - rimClearance).coerceAtLeast(0.12))
-
-                val radiusDiff = targetR - dist
-                // If we overshoot outward past the groove, pull back harder to prevent rim grazing.
-                val overshoot = (dist - targetR).coerceAtLeast(0.0)
-                val overshootMul = (1.0 + (overshoot / rimClearance.coerceAtLeast(1e-6)).coerceIn(0.0, 1.5) * 0.85)
-                val radialPull = radiusDiff * 1.35 * ringStrength * overshootMul
-
-                val v = self.linearVelocity
-                var vx = v.x + nx * radialPull * dt
-                var vy = v.y + ny * radialPull * dt
-
-                val tangentialX = -ny * rt.orbitDirection.toDouble()
-                val tangentialY = nx * rt.orbitDirection.toDouble()
-                val currentTangentialVelocity = vx * tangentialX + vy * tangentialY
-
-                // Orbit controller: kill radial drift, preserve tangential motion.
-                // This is what makes the stabilized path a clean circle around arena center.
-                val currentRadialVelocity = vx * nx + vy * ny
-                // Ring motion: target cruise speed unchanged; corrective accelerations use [ringStrength].
-                val desiredOrbitSpeed =
-                    (1.40 + 0.65 * strength) * (0.92 + 0.12 * (balance - 0.65) / 0.70)
-                val speedSq = vx * vx + vy * vy
-                val tangentialSpeedSq = (speedSq - currentRadialVelocity * currentRadialVelocity).coerceAtLeast(0.0)
-                val tangentialSpeed = sqrt(tangentialSpeedSq)
-                // At high tangential speed, radial error grows quickly — scale groove damping up (not using total v² for centripetal).
-                val highSpeedMul =
-                    (1.0 + (tangentialSpeed / (desiredOrbitSpeed * 1.85 + 1e-6)).coerceIn(0.0, 2.8) * 0.42)
-                val radialDamp =
-                    when (rt.stabilization) {
-                        StabilizationLevel.OUTER_RING -> 9.5
-                        else -> 7.0
-                    } * ringStrength * highSpeedMul
-                vx -= nx * currentRadialVelocity * radialDamp * dt
-                vy -= ny * currentRadialVelocity * radialDamp * dt
-
-                val orbitAccel =
-                    (0.95 * ringStrength) * (1.08 - 0.18 * (balance - 0.65) / 0.70) * highSpeedMul
-
-                if (currentTangentialVelocity < desiredOrbitSpeed * 0.9) {
-                    vx += tangentialX * orbitAccel * dt
-                    vy += tangentialY * orbitAccel * dt
-                } else if (currentTangentialVelocity > desiredOrbitSpeed * 1.1) {
-                    vx -= tangentialX * orbitAccel * 0.5 * dt
-                    vy -= tangentialY * orbitAccel * 0.5 * dt
-                }
-
-                // Centripetal correction: tangential speed only, from velocity *after* groove + tangent updates.
-                if (dist > 0.05) {
-                    val vRad = vx * nx + vy * ny
-                    val tanSq = (vx * vx + vy * vy - vRad * vRad).coerceAtLeast(0.0)
-                    val centripetal = tanSq / dist
-                    // Balanced tops need less centripetal damping to avoid "wobble braking".
-                    val k = (0.12 * ringStrength) * (1.10 - 0.22 * (balance - 0.65) / 0.70)
-                    vx -= nx * centripetal * k * dt
-                    vy -= ny * centripetal * k * dt
-                }
-
-                self.setLinearVelocity(vx, vy)
             }
         }
     }
 
+    private fun createSparks(px: Double, py: Double, colorArgb: Int, intensity: Double) {
+        val count = ((pseudoRandom(sessionSeed xor tickCount.toInt(), 3101) * 15.0 + 15.0) * intensity)
+            .toInt()
+            .coerceIn(1, 55)
+        repeat(count) { i ->
+            if (particles.size >= maxParticles) return
+            val u1 = pseudoRandom(sessionSeed xor tickCount.toInt() xor i, 3102 + i)
+            val u2 = pseudoRandom(sessionSeed xor tickCount.toInt() xor i, 4102 + i)
+            val u3 = pseudoRandom(sessionSeed xor tickCount.toInt() xor i, 5102 + i)
+            val angle = u1 * PI * 2.0
+            val speed = u2 * 5.0 * intensity * scaleFactor * referenceHz
+            val decay = u3 * 0.04 + 0.01
+            val sz = (pseudoRandom(sessionSeed, 6102 + i) * 4.0 + 1.0) * scaleFactor
+            particles.add(
+                Particle(
+                    x = px,
+                    y = py,
+                    vx = cos(angle) * speed,
+                    vy = sin(angle) * speed,
+                    life = 1.0,
+                    decay = decay,
+                    size = sz,
+                    color = colorArgb,
+                ),
+            )
+        }
+    }
+
+    private fun emitParticleBurst(
+        x: Double,
+        y: Double,
+        colorArgb: Int,
+        count: Int,
+        speedMul: Double,
+        salt: Int,
+    ) {
+        val c = count.coerceIn(0, 28)
+        repeat(c) { i ->
+            if (particles.size >= maxParticles) return
+            val u1 = pseudoRandom(sessionSeed xor tickCount.toInt(), salt + i * 5)
+            val u2 = pseudoRandom(sessionSeed xor tickCount.toInt(), salt + i * 5 + 1)
+            val ang = u1 * PI * 2.0
+            val speed = (0.018 + u2 * 0.09) * speedMul * scaleFactor * referenceHz * 0.35
+            val decay = (0.008 + pseudoRandom(sessionSeed, salt + i + 400) * 0.04).coerceIn(0.006, 0.055)
+            val sz = (0.006 + pseudoRandom(sessionSeed, salt + i + 800) * 0.014).coerceIn(0.004, 0.028)
+            particles.add(
+                Particle(
+                    x = x,
+                    y = y,
+                    vx = cos(ang) * speed,
+                    vy = sin(ang) * speed,
+                    life = 0.85 + pseudoRandom(sessionSeed, salt + i + 900) * 0.35,
+                    decay = decay,
+                    size = sz,
+                    color = colorArgb,
+                ),
+            )
+        }
+    }
+
     private fun emitImpactSparks(x: Double, y: Double, intensity: Float) {
-        if (effects.size >= 40) return
         val it = intensity.coerceIn(0.1f, 8.0f)
-        effects += CollisionEffect(x = x.toFloat(), y = y.toFloat(), intensity = it, age = 0f)
+        if (effects.size < 40) {
+            effects += CollisionEffect(x = x.toFloat(), y = y.toFloat(), intensity = it, age = 0f)
+        }
+        createSparks(
+            x,
+            y,
+            AndroidColor.argb(220, 255, 255, 255),
+            (0.35 + it * 0.18).toDouble().coerceIn(0.2, 2.4),
+        )
     }
 
     private fun emitAttackTrail(x: Double, y: Double, intensity: Float) {
         if (effects.size >= 40) return
         effects += CollisionEffect(x = x.toFloat(), y = y.toFloat(), intensity = intensity.coerceIn(0.1f, 2.0f), age = 0f)
+    }
+
+    /**
+     * [Particle.vx]/[Particle.vy] are sim units per second. Decay matches HTML “per frame” fade at 60Hz.
+     */
+    private fun updateParticles(dt: Double) {
+        if (particles.isEmpty()) return
+        val frames = dt * referenceHz
+        var w = 0
+        for (i in particles.indices) {
+            val p = particles[i]
+            p.x += p.vx * dt
+            p.y += p.vy * dt
+            p.life -= p.decay * frames
+            if (p.life > 0.0) {
+                if (w != i) particles[w] = p
+                w++
+            }
+        }
+        if (w < particles.size) particles.subList(w, particles.size).clear()
     }
 
     private fun tickEffects(dt: Float) {
@@ -933,6 +1104,7 @@ class BattleEngine(
             }
             if (w < impacts.size) impacts.subList(w, impacts.size).clear()
         }
+        updateParticles(dt.toDouble())
     }
 
     private fun pairKey(a: Long, b: Long): Long {
@@ -955,10 +1127,15 @@ class BattleEngine(
     }
 
     private fun killTop(body: Body) {
+        val rt = body.userData as? TopRuntime
+        if (rt != null) {
+            rt.currentHp = 0.0
+            rt.currentStamina = 0.0
+        }
+        syncFromRuntime()
         body.setLinearVelocity(0.0, 0.0)
         body.setAngularVelocity(0.0)
         body.setEnabled(false)
-        // Burst particle effect TODO: hook when you add effects back to snapshot
     }
 
 }

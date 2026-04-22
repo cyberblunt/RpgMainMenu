@@ -21,6 +21,7 @@ import com.zerotoler.rpgmenu.ui.battleprep.PreBattleSelectionViewModel
 import com.zerotoler.rpgmenu.ui.parts.PartDetailScreen
 import com.zerotoler.rpgmenu.ui.root.AppRootScaffold
 import com.zerotoler.rpgmenu.ui.screens.PlaceholderScreen
+import com.zerotoler.rpgmenu.ui.spintop.SpinTopArenaScreen
 import com.zerotoler.rpgmenu.ui.screens.academy.AcademyScreen
 import com.zerotoler.rpgmenu.ui.screens.battlepass.BattlePassScreen
 import com.zerotoler.rpgmenu.ui.screens.chest.ChestScreen
@@ -125,7 +126,15 @@ fun AppNavHost(
             PlaceholderScreen(title = "Missions", onBack = { navController.popBackStack() })
         }
         composable(Routes.MENU) {
-            PlaceholderScreen(title = "System Menu", onBack = { navController.popBackStack() })
+            PlaceholderScreen(
+                title = "System Menu",
+                onBack = { navController.popBackStack() },
+                primaryActionLabel = "Spin-top arena (prototype)",
+                onPrimaryAction = { navController.navigate(Routes.SPIN_TOP_ARENA) },
+            )
+        }
+        composable(Routes.SPIN_TOP_ARENA) {
+            SpinTopArenaScreen(onBack = { navController.popBackStack() })
         }
         composable(Routes.CHAT_TICKER) {
             PlaceholderScreen(

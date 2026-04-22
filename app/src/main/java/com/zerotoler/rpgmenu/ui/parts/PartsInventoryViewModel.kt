@@ -17,6 +17,8 @@ import com.zerotoler.rpgmenu.domain.model.PartCategory
 import com.zerotoler.rpgmenu.domain.model.PlayerPartState
 import com.zerotoler.rpgmenu.domain.model.SpinDirection
 import com.zerotoler.rpgmenu.domain.model.Team
+import com.zerotoler.rpgmenu.data.db.entity.WalletEntity
+import com.zerotoler.rpgmenu.domain.usecase.AutoConfigLoadoutUseCase
 import com.zerotoler.rpgmenu.domain.usecase.ComputeBuildStatsUseCase
 import com.zerotoler.rpgmenu.domain.usecase.EquipPartUseCase
 import com.zerotoler.rpgmenu.domain.usecase.GetVisiblePartsUseCase
@@ -56,6 +58,7 @@ class PartsInventoryViewModel(
     private val computeBuildStatsUseCase: ComputeBuildStatsUseCase,
     private val getVisiblePartsUseCase: GetVisiblePartsUseCase,
     private val equipPartUseCase: EquipPartUseCase,
+    private val autoConfigLoadoutUseCase: AutoConfigLoadoutUseCase,
 ) : ViewModel() {
 
     private val slotIndex = MutableStateFlow(0)
@@ -102,7 +105,9 @@ class PartsInventoryViewModel(
     val uiState: StateFlow<PartsInventoryUiState> = combine(
         inventoryInputs,
         transientError,
-    ) { inputs, err ->
+        playerProgressRepository.observeWallet(),
+        playerProgressRepository.observeProfile(),
+    ) { inputs, err, wallet, profile ->
         val pack = inputs.pack
         val teams = inputs.teams
         val slot = inputs.slot
@@ -136,6 +141,16 @@ class PartsInventoryViewModel(
         val counts = PartCategory.entries.associateWith { pc ->
             pack.catalog.count { it.category == pc }
         }
+        val ownedCounts = PartCategory.entries.associateWith { pc ->
+            pack.catalog.count { p -> p.category == pc && playerMap[p.id]?.owned == true }
+        }
+        val w = wallet ?: WalletEntity(
+            id = WalletEntity.SINGLETON_ID,
+            gold = 0L,
+            gems = 0L,
+            chestKeys = 0,
+            championshipTickets = 0,
+        )
         PartsInventoryUiState(
             activeTeamId = pack.teamId,
             activeTeamDisplayName = teamLabel,
@@ -150,6 +165,11 @@ class PartsInventoryViewModel(
             buildPreviewState = preview,
             loadoutSlotsSummary = summaries.ifEmpty { (0 until 3).map { LoadoutSlotSummary(it, 0) } },
             categoryCounts = counts,
+            ownedCategoryCounts = ownedCounts,
+            playerDisplayName = profile.displayName,
+            playerLevel = profile.level,
+            gold = w.gold,
+            gems = w.gems,
             isLoading = false,
             isEmptyInventory = emptyInv,
             errorMessage = err,
@@ -232,6 +252,13 @@ class PartsInventoryViewModel(
 
     fun refresh() {
         transientError.value = null
+    }
+
+    fun runAutoConfig() {
+        viewModelScope.launch {
+            val teamId = currentTeamId()
+            autoConfigLoadoutUseCase(teamId, slotIndex.value)
+        }
     }
 
     private suspend fun currentTeamId(): String {

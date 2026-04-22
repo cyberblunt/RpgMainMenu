@@ -22,6 +22,9 @@ object Routes {
     const val EVENT_BOARD = "event_board"
     const val MISSIONS = "missions"
     const val MENU = "menu"
+
+    /** Standalone Canvas + Choreographer prototype (logical arena coords). */
+    const val SPIN_TOP_ARENA = "spin_top_arena"
     const val CHAT_TICKER = "chat_ticker"
     const val FREE_CHEST = "free_chest"
     const val CHEST = "chest"

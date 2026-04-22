@@ -33,6 +33,7 @@ import com.zerotoler.rpgmenu.domain.usecase.ComputeBuildStatsUseCase
 import com.zerotoler.rpgmenu.domain.usecase.BuildBattleTopFromSelectedLoadoutUseCase
 import com.zerotoler.rpgmenu.domain.usecase.CreateBattleSessionUseCase
 import com.zerotoler.rpgmenu.domain.usecase.GetBattleReadyTeamUseCase
+import com.zerotoler.rpgmenu.domain.usecase.AutoConfigLoadoutUseCase
 import com.zerotoler.rpgmenu.domain.usecase.EquipPartUseCase
 import com.zerotoler.rpgmenu.domain.usecase.GetVisiblePartsUseCase
 import com.zerotoler.rpgmenu.domain.usecase.OpenChestUseCase
@@ -78,6 +79,11 @@ class AppContainer(context: Context) {
     val computeBuildStatsUseCase = ComputeBuildStatsUseCase()
     val getVisiblePartsUseCase = GetVisiblePartsUseCase()
     val equipPartUseCase = EquipPartUseCase(
+        catalogRepository,
+        inventoryRepository,
+        loadoutRepository,
+    )
+    val autoConfigLoadoutUseCase = AutoConfigLoadoutUseCase(
         catalogRepository,
         inventoryRepository,
         loadoutRepository,
@@ -135,6 +141,7 @@ class AppContainer(context: Context) {
                     computeBuildStatsUseCase = computeBuildStatsUseCase,
                     getVisiblePartsUseCase = getVisiblePartsUseCase,
                     equipPartUseCase = equipPartUseCase,
+                    autoConfigLoadoutUseCase = autoConfigLoadoutUseCase,
                 ) as T
             }
         }
